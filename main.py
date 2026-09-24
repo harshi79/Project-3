@@ -2,14 +2,16 @@ import os
 import html as html_lib
 import asyncio
 import random
+from pathlib import Path
+import httpx
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Dict, Any
 
 from dotenv import load_dotenv
 import asyncpg
+from admin_management import register_admin_management
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaPhoto
@@ -55,6 +57,8 @@ SETSTARTMSG_CONTENT = 11
 # Global scheduler and application reference (used by webhook endpoint)
 scheduler = AsyncIOScheduler()
 bot_application = None
+telegram_api_http: Optional[httpx.AsyncClient] = None
+BOT_USERNAME = os.getenv("BOT_USERNAME", "YoriFederation").lstrip("@")
 
 # ---------- Rarity System ----------
 RARITY_WEIGHTS = {
@@ -405,14 +409,14 @@ class Database:
             ''')
             # Migration: add streak columns if group_user_data existed without them
             await conn.execute('''
-                ALTER TABLE group_user_data ADD COLUMN IF NOT EXISTS daily_streak INT DEFAULT 0
+                ALTER TABLE IF EXISTS group_user_data ADD COLUMN IF NOT EXISTS daily_streak INT DEFAULT 0
             ''')
             await conn.execute('''
-                ALTER TABLE group_user_data ADD COLUMN IF NOT EXISTS last_daily_date DATE
+                ALTER TABLE IF EXISTS group_user_data ADD COLUMN IF NOT EXISTS last_daily_date DATE
             ''')
             # Migration: add language column to user_info
             await conn.execute('''
-                ALTER TABLE user_info ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'en'
+                ALTER TABLE IF EXISTS user_info ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'en'
             ''')
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
@@ -1191,6 +1195,80 @@ db = Database()
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
+
+async def call_telegram_api(method: str, payload: Dict[str, Any]) -> Optional[Any]:
+    """Call newer Bot API methods not yet exposed by the pinned PTB client.
+
+    Rich Messages are a standard Bot API capability (no Telegram Premium required).
+    A failure intentionally returns None so all UI paths can fall back to ordinary
+    sendMessage/editMessageText calls when a self-hosted Bot API server is older.
+    """
+    client = telegram_api_http
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0))
+    try:
+        response = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload
+        )
+        data = response.json()
+        if response.is_success and data.get("ok"):
+            return data.get("result")
+        description = str(data.get("description", "Telegram API request failed"))[:180]
+        print(f"[Telegram API] {method} fallback ({data.get('error_code', response.status_code)}): {description}")
+    except Exception as exc:
+        print(f"[Telegram API] {method} fallback: {type(exc).__name__}")
+    finally:
+        if owns_client:
+            await client.aclose()
+    return None
+
+
+async def send_rich_or_text_message(
+    bot, chat_id: int, rich_markdown: str, fallback_text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+):
+    """Prefer Bot API 10.1 Rich Messages, with a normal-message fallback."""
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "rich_message": {"markdown": rich_markdown},
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup.to_dict()
+    result = await call_telegram_api("sendRichMessage", payload)
+    if result:
+        return result
+    return await bot.send_message(
+        chat_id=chat_id, text=fallback_text, reply_markup=reply_markup
+    )
+
+
+async def edit_rich_or_text_message(
+    query, rich_markdown: str, fallback_text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+):
+    """Edit the management panel in place for a smooth, non-spamming UI."""
+    message = query.message
+    payload: Dict[str, Any] = {
+        "chat_id": message.chat_id,
+        "message_id": message.message_id,
+        "rich_message": {"markdown": rich_markdown},
+    }
+    payload["reply_markup"] = reply_markup.to_dict() if reply_markup else {"inline_keyboard": []}
+    result = await call_telegram_api("editMessageText", payload)
+    if result is not None:
+        return result
+    try:
+        return await query.edit_message_text(
+            text=fallback_text, reply_markup=reply_markup, disable_web_page_preview=True
+        )
+    except BadRequest as exc:
+        # Telegram reports a harmless "message is not modified" for repeated taps.
+        if "message is not modified" not in str(exc).lower():
+            raise
+        return None
+
+
 async def ensure_started(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if not user:
@@ -1415,6 +1493,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     await db.register_start(user.id)
+    # Storefront deep links start a direct purchase flow inside Telegram.
+    # The internal card IDs use a leading '#', which is not valid in start args.
+    if context.args and context.args[0].startswith("buy_"):
+        card_id = context.args[0][4:]
+        if card_id and len(card_id) <= 32:
+            context.args = [f"#{card_id.lstrip('#')}"]
+            await buy(update, context)
+            return
     video_id = await db.get_start_video()
     custom_msg = await db.get_start_msg()
     name_display = html_lib.escape(user.first_name or "Collector")
@@ -1445,55 +1531,66 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(welcome_text, reply_markup=keyboard, parse_mode="HTML")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """🎮 *Available Commands*
+    rich_text = """# 🎴 Soul Collector · Command guide
 
-*💰 Economy*
-/daily - Claim coins (every 2h, per group)
-/claim - Claim random character (every 11h, per group)
-/wallet - Show your coins
+Collect characters, earn coins, and explore the market. Use the buttons to jump into the store or switch language.
 
-*📦 Collection*
-/vault - Your collected characters (per group)
-/market - View buyable characters
-/buy <id> [id2 ...] - Buy character(s)
-/sell <id> - Sell character (70% refund)
-/search <n> - Search characters
+## 💰 Economy
+- `/daily` — claim coins (every 2 hours)
+- `/claim` — claim a character (11-hour cooldown)
+- `/wallet` — view your balance
 
-*🎭 Drop System (Groups)*
-/guess <n> - Guess the dropped character
-/enabledrops - Enable drops (admin/owner)
-/disabledrops - Disable drops (admin/owner)
+## 📦 Collection
+- `/vault` — browse your characters
+- `/market` — open the character market
+- `/buy card-id` — purchase a character
+- `/sell card-id` — sell a character for 70% of its price
+- `/search name` — find a character
 
-*🏆 Leaderboard (Groups)*
-/leaderboard - View top global collectors
-_(Auto-posts & pins every Sunday with prizes!)_
+## 🎭 Play together
+- `/guess name` — guess the active group drop
+- `/enabledrops` and `/disabledrops` — group-admin controls
+- `/leaderboard` — view the global collector rankings
+- `/tasks` and `/refer` — rewards and referral links
 
-*📋 Tasks (DM Only)*
-/tasks - View and complete tasks
-/refer - Get your referral link
+## 👑 Owner tools
+- `/manage` — private inline control panel for stats, characters, tasks, and broadcasts
+- `/addcharacter`, `/broadcast`, `/stats` — owner workflows
 
-*👥 Group Admin*
-/listadmins - List human admins
-/calladmins - Mention all admins (10min cooldown)
+## Other
+- `/start` — open your collector profile · `/lang` — change language"""
+    fallback = """SOUL COLLECTOR · COMMAND GUIDE
 
-*👑 Owner/Dev*
-/addcharacter - Add new character (interactive)
-/remove <id> - Remove character
-/listchar - List all characters (IDs)
-/addcoins (reply) - Add coins
-/removecoins (reply) - Remove coins
-/setstartvid (reply to video)
-/setwelcomepic (reply to photo, in group)
-/setstartmsg - Update start message caption
-/broadcast - Broadcast to all users & groups
-/resetgrpdata - Reset group data (danger)
-/stats - Bot statistics
-/groupmembers <id> - Members of a group
+ECONOMY
+/daily — claim coins (every 2 hours)
+/claim — claim a character (11-hour cooldown)
+/wallet — view your balance
 
-*Other*
-/start - Start the bot
-/help - This menu"""
-    await update.message.reply_text(text, parse_mode="Markdown")
+COLLECTION
+/vault — browse your characters
+/market — open the character market
+/buy card-id — purchase a character
+/sell card-id — sell a character for 70% of its price
+/search name — find a character
+
+PLAY TOGETHER
+/guess name — guess the active group drop
+/enabledrops and /disabledrops — group-admin controls
+/leaderboard — view the global collector rankings
+/tasks and /refer — rewards and referral links
+
+OWNER TOOLS
+/manage — private inline control panel
+/addcharacter, /broadcast, /stats — owner workflows
+
+/start — open your collector profile · /lang — change language"""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Open Character Market", url=WEB_STORE_URL)],
+        [InlineKeyboardButton("🌍 Language", callback_data="lang:choose")],
+    ])
+    await send_rich_or_text_message(
+        context.bot, update.effective_chat.id, rich_text, fallback, keyboard
+    )
 
 async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2393,7 +2490,7 @@ async def broadcast_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Broadcast to all started users ---
     user_ids = await db.get_all_started_user_ids()
     u_sent, u_failed = 0, 0
-    for uid in user_ids:
+    for index, uid in enumerate(user_ids, start=1):
         try:
             await _send_broadcast_msg(context.bot, uid, data)
             u_sent += 1
@@ -2402,7 +2499,16 @@ async def broadcast_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u_failed += 1
         except Exception:
             u_failed += 1
-        # Respect Telegram rate limit: ~20 msg/sec
+        # Respect Telegram rate limit: ~20 msg/sec. Edit one status message in place.
+        if index % 40 == 0 or index == len(user_ids):
+            try:
+                await status_msg.edit_text(
+                    f"📣 Users: {index}/{len(user_ids)} processed\n"
+                    f"✅ {u_sent} sent · ⏭ {u_failed} skipped"
+                )
+            except Exception:
+                # Status reporting must never interrupt recipient delivery.
+                pass
         await asyncio.sleep(0.05)
 
     try:
@@ -2415,7 +2521,7 @@ async def broadcast_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Broadcast to all registered groups ---
     group_ids = await db.get_all_group_ids()
     g_sent, g_failed, g_pinned = 0, 0, 0
-    for gid in group_ids:
+    for index, gid in enumerate(group_ids, start=1):
         try:
             sent_msg = await _send_broadcast_msg(context.bot, gid, data)
             g_sent += 1
@@ -2431,6 +2537,15 @@ async def broadcast_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
             g_failed += 1
         except Exception:
             g_failed += 1
+        if index % 40 == 0 or index == len(group_ids):
+            try:
+                await status_msg.edit_text(
+                    f"📣 Groups: {index}/{len(group_ids)} processed\n"
+                    f"✅ {g_sent} sent · ⏭ {g_failed} skipped"
+                )
+            except Exception:
+                # Status reporting must never interrupt recipient delivery.
+                pass
         await asyncio.sleep(0.05)
 
     context.user_data.pop('broadcast_msg', None)
@@ -2589,334 +2704,33 @@ async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(t(chosen, confirm_key))
 
 # ---------- Web Preview (FastAPI) ----------
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-    <title>Anime Character Store</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: linear-gradient(145deg, #0b0b1a 0%, #1a1a2e 100%);
-            font-family: 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-            min-height: 100vh;
-            color: #fff;
-        }
-
-        /* ── Header ── */
-        .header {
-            text-align: center;
-            padding: 28px 16px 10px;
-        }
-        .header h1 {
-            font-size: 1.65rem;
-            font-weight: 800;
-            background: linear-gradient(90deg, #a78bfa, #f472b6);
-            -webkit-background-clip: text; background-clip: text;
-            color: transparent;
-            letter-spacing: -0.5px;
-        }
-        .header p { color: #666; font-size: 0.82rem; margin-top: 5px; }
-
-        /* ── Search Bar ── */
-        .search-wrap {
-            padding: 14px 16px 10px;
-            max-width: 500px;
-            margin: 0 auto;
-        }
-        .search-bar {
-            width: 100%;
-            padding: 13px 18px;
-            background: rgba(255,255,255,0.06);
-            border: 1.5px solid rgba(255,255,255,0.1);
-            border-radius: 50px;
-            color: #fff;
-            font-size: 0.93rem;
-            outline: none;
-            transition: border-color 0.25s;
-        }
-        .search-bar::placeholder { color: #555; }
-        .search-bar:focus { border-color: #a78bfa; background: rgba(167,139,250,0.07); }
-
-        /* ── Anime Filter Strip ── */
-        .filter-strip {
-            padding: 4px 12px 14px;
-            overflow-x: auto;
-            white-space: nowrap;
-            scrollbar-width: none;
-        }
-        .filter-strip::-webkit-scrollbar { display: none; }
-        .anime-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            padding: 7px 14px;
-            margin-right: 7px;
-            background: rgba(255,255,255,0.06);
-            border: 1.5px solid rgba(255,255,255,0.09);
-            border-radius: 50px;
-            color: #aaa;
-            font-size: 0.8rem;
-            cursor: pointer;
-            transition: all 0.2s;
-            white-space: nowrap;
-            user-select: none;
-            -webkit-tap-highlight-color: transparent;
-        }
-        .anime-btn.active {
-            background: linear-gradient(90deg, #7c3aed, #db2777);
-            border-color: transparent;
-            color: #fff;
-            font-weight: 700;
-            box-shadow: 0 4px 14px rgba(124,58,237,0.4);
-        }
-        .btn-count {
-            background: rgba(255,255,255,0.14);
-            border-radius: 20px;
-            padding: 1px 7px;
-            font-size: 0.72rem;
-            font-weight: 600;
-        }
-        .anime-btn.active .btn-count { background: rgba(255,255,255,0.22); }
-
-        /* ── Card Area ── */
-        .main {
-            max-width: 500px;
-            margin: 0 auto;
-            padding: 0 16px 50px;
-        }
-        .card {
-            background: rgba(18,18,38,0.82);
-            backdrop-filter: blur(14px);
-            border-radius: 28px;
-            padding: 18px;
-            border: 1px solid rgba(255,255,255,0.07);
-            box-shadow: 0 22px 44px rgba(0,0,0,0.55);
-            transition: transform 0.22s;
-        }
-        .card:hover { transform: translateY(-4px); }
-        .character-img {
-            width: 100%; border-radius: 20px;
-            object-fit: cover; aspect-ratio: 1/1;
-            background: #0d0d1a;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.45);
-            display: block;
-        }
-        .info { margin-top: 14px; }
-        .char-name {
-            font-size: 1.55rem; font-weight: 800;
-            background: linear-gradient(90deg, #a78bfa, #f472b6);
-            -webkit-background-clip: text; background-clip: text;
-            color: transparent;
-            line-height: 1.25;
-            margin-bottom: 5px;
-        }
-        .char-anime { font-size: 0.92rem; color: #bbb; margin-bottom: 10px; }
-        .badges { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 10px; }
-        .badge {
-            padding: 4px 13px; border-radius: 40px;
-            font-size: 0.78rem; font-weight: 700;
-        }
-        .badge-rarity { background: rgba(255,215,0,0.12); color: #ffd700; border: 1px solid rgba(255,215,0,0.2); }
-        .badge-price  { background: rgba(124,252,0,0.10); color: #7CFC00;  border: 1px solid rgba(124,252,0,0.18); }
-        .char-id { font-family: monospace; font-size: 0.76rem; color: #555; margin-top: 4px; }
-
-        /* ── Navigation ── */
-        .nav {
-            display: flex; align-items: center;
-            justify-content: center; gap: 18px;
-            margin-top: 18px;
-        }
-        .nav-btn {
-            background: rgba(124,58,237,0.25);
-            border: 1.5px solid rgba(124,58,237,0.35);
-            color: #fff; font-size: 1.25rem;
-            padding: 11px 24px; border-radius: 50px;
-            cursor: pointer; transition: all 0.2s;
-            -webkit-tap-highlight-color: transparent;
-        }
-        .nav-btn:active { transform: scale(0.93); }
-        .nav-btn:hover:not(:disabled) { background: rgba(124,58,237,0.45); }
-        .nav-btn:disabled { opacity: 0.28; cursor: default; }
-        .page-info { color: #777; font-size: 0.84rem; min-width: 70px; text-align: center; }
-
-        /* ── Empty / Loading ── */
-        .empty {
-            text-align: center; padding: 64px 20px;
-            color: #555; font-size: 0.95rem;
-        }
-        .empty-icon { font-size: 2.8rem; margin-bottom: 12px; }
-        .loading { text-align: center; padding: 80px 20px; }
-        .dot {
-            display: inline-block; width: 9px; height: 9px;
-            background: #a78bfa; border-radius: 50%;
-            margin: 0 3px;
-            animation: blink 1.2s infinite ease-in-out;
-        }
-        .dot:nth-child(2){ animation-delay:.2s }
-        .dot:nth-child(3){ animation-delay:.4s }
-        @keyframes blink {
-            0%,80%,100%{ transform:scale(1); opacity:.6 }
-            40%{ transform:scale(1.5); opacity:1 }
-        }
-
-        @media(max-width:420px){
-            .char-name{ font-size:1.3rem }
-            .card{ padding:14px }
-            .header h1{ font-size:1.4rem }
-        }
-    </style>
-</head>
-<body>
-
-<div class="header">
-    <h1>✨ Anime Character Store</h1>
-    <p>Collect · Trade · Dominate</p>
-</div>
-
-<div class="search-wrap">
-    <input type="text" id="searchBar" class="search-bar" placeholder="🔍  Search by name, anime or ID…" autocomplete="off">
-</div>
-
-<div class="filter-strip" id="filterStrip"></div>
-
-<div class="main">
-    <div id="cardArea">
-        <div class="loading">
-            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-            <p style="margin-top:18px;color:#555;font-size:0.88rem">Loading characters…</p>
-        </div>
-    </div>
-    <div class="nav" id="navRow" style="display:none">
-        <button class="nav-btn" id="prevBtn">◀</button>
-        <span class="page-info" id="pageInfo"></span>
-        <button class="nav-btn" id="nextBtn">▶</button>
-    </div>
-</div>
-
-<script>
-(function(){
-    const RARITY_EMOJI = {
-        'Common':'⚪','Uncommon':'🟢','Elite':'🔵','Epic':'🟣','Mythic':'🔴',
-        'Waifu':'💖','Special Edition':'✨','Limited':'⏳','Event':'🎉','Legendary':'🌟'
-    };
-
-    let all = [], shown = [], idx = 0, activeAnime = 'All';
-
-    const cardArea   = document.getElementById('cardArea');
-    const navRow     = document.getElementById('navRow');
-    const prevBtn    = document.getElementById('prevBtn');
-    const nextBtn    = document.getElementById('nextBtn');
-    const pageInfo   = document.getElementById('pageInfo');
-    const filterStrip= document.getElementById('filterStrip');
-    const searchBar  = document.getElementById('searchBar');
-
-    function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-
-    function buildFilters(){
-        const counts = {};
-        all.forEach(c => counts[c.anime] = (counts[c.anime]||0)+1);
-        const names = Object.keys(counts).sort();
-        let html = `<span class="anime-btn active" data-a="All">🌸 All<span class="btn-count">${all.length}</span></span>`;
-        names.forEach(a => {
-            html += `<span class="anime-btn" data-a="${esc(a)}">${esc(a)}<span class="btn-count">${counts[a]}</span></span>`;
-        });
-        filterStrip.innerHTML = html;
-        filterStrip.querySelectorAll('.anime-btn').forEach(btn => {
-            btn.addEventListener('click', ()=>{
-                activeAnime = btn.dataset.a;
-                filterStrip.querySelectorAll('.anime-btn').forEach(b=>b.classList.remove('active'));
-                btn.classList.add('active');
-                idx = 0;
-                applyFilter();
-            });
-        });
-    }
-
-    function applyFilter(){
-        const q = searchBar.value.trim().toLowerCase();
-        shown = all.filter(c => {
-            const okAnime  = activeAnime === 'All' || c.anime === activeAnime;
-            const okSearch = !q || c.name.toLowerCase().includes(q)
-                              || c.anime.toLowerCase().includes(q)
-                              || c.char_id.toLowerCase().includes(q);
-            return okAnime && okSearch;
-        });
-        idx = 0;
-        render();
-    }
-
-    function render(){
-        if(!shown.length){
-            cardArea.innerHTML = `<div class="empty"><div class="empty-icon">🌙</div><p>No characters found.<br><span style="font-size:.82rem;color:#444">Try a different filter or search.</span></p></div>`;
-            navRow.style.display='none';
-            return;
-        }
-        const c = shown[idx];
-        const em = RARITY_EMOJI[c.rarity]||'⭐';
-        cardArea.innerHTML = `
-        <div class="card">
-            <img class="character-img" src="${esc(c.img_url)}" alt="${esc(c.name)}" loading="lazy">
-            <div class="info">
-                <div class="char-name">${em} ${esc(c.name)}</div>
-                <div class="char-anime">🎬 ${esc(c.anime)}</div>
-                <div class="badges">
-                    <span class="badge badge-rarity">${em} ${esc(c.rarity)}</span>
-                    <span class="badge badge-price">💰 ${Number(c.price).toLocaleString()} coins</span>
-                </div>
-                <div class="char-id">🆔 ${esc(c.char_id)}</div>
-            </div>
-        </div>`;
-        navRow.style.display = 'flex';
-        pageInfo.textContent = `${idx+1} / ${shown.length}`;
-        prevBtn.disabled = idx === 0;
-        nextBtn.disabled = idx === shown.length-1;
-    }
-
-    prevBtn.addEventListener('click', ()=>{ if(idx>0){ idx--; render(); } });
-    nextBtn.addEventListener('click', ()=>{ if(idx<shown.length-1){ idx++; render(); } });
-
-    let debounce;
-    searchBar.addEventListener('input', ()=>{ clearTimeout(debounce); debounce=setTimeout(applyFilter,220); });
-
-    fetch('/api/characters')
-        .then(r=>r.json())
-        .then(data=>{
-            all = data; shown = data;
-            if(!all.length){
-                cardArea.innerHTML=`<div class="empty"><div class="empty-icon">📭</div><p>No characters yet.<br><span style="font-size:.82rem;color:#444">Check back soon!</span></p></div>`;
-                return;
-            }
-            buildFilters();
-            render();
-        })
-        .catch(()=>{
-            cardArea.innerHTML=`<div class="empty"><div class="empty-icon">⚠️</div><p>Failed to load.<br><span style="font-size:.82rem;color:#444">Please refresh the page.</span></p></div>`;
-        });
-})();
-</script>
-</body>
-</html>
-"""
+STORE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "store.html"
 
 # ---------- FastAPI App ----------
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/", response_class=HTMLResponse)
 async def store_page():
-    return HTML_TEMPLATE
+    return HTMLResponse(STORE_TEMPLATE_PATH.read_text(encoding="utf-8"))
 
 @app.get("/api/characters")
 async def api_characters():
-    chars, _ = await db.get_market_characters(limit=500, offset=0)
-    return [
-        {"char_id": c["char_id"], "name": c["name"], "anime": c["anime"],
-         "img_url": c["img_url"], "rarity": c["rarity"], "price": c["price"]}
-        for c in chars
-    ]
+    chars, _ = await db.get_market_characters(limit=1000, offset=0)
+    bot_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "https://t.me/"
+    result = []
+    for char in chars:
+        char_id = str(char["char_id"])
+        start_id = char_id.lstrip("#")
+        buy_url = f"{bot_url}?start=buy_{start_id}" if start_id and len(start_id) <= 32 else ""
+        image_url = str(char["img_url"] or "")
+        if not image_url.startswith("https://"):
+            image_url = ""
+        result.append({
+            "char_id": char_id, "name": char["name"], "anime": char["anime"],
+            "img_url": image_url, "rarity": char["rarity"], "rarity_tier": char.get("rarity_tier", 0),
+            "price": char["price"], "buy_url": buy_url, "bot_url": bot_url,
+        })
+    return result
 
 @app.get("/health")
 async def health_check():
@@ -2939,7 +2753,9 @@ async def telegram_webhook(request: Request):
 
 # ---------- Main Entry Point ----------
 async def run_bot():
-    global bot_application
+    global bot_application, telegram_api_http, BOT_USERNAME
+    if telegram_api_http is None:
+        telegram_api_http = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0))
     await db.connect()
     await db.init_tables()
 
@@ -2951,6 +2767,10 @@ async def run_bot():
         bot_application = Application.builder().token(BOT_TOKEN).build()
 
     bot_application.add_error_handler(error_handler)
+    register_admin_management(
+        bot_application, db, OWNER_ID,
+        send_rich_or_text_message, edit_rich_or_text_message,
+    )
 
     # User commands
     bot_application.add_handler(CommandHandler("start", start))
@@ -3053,6 +2873,9 @@ async def run_bot():
 
     await start_drop_scheduler(bot_application.bot)
     await bot_application.initialize()
+    bot_info = await bot_application.bot.get_me()
+    if bot_info.username:
+        BOT_USERNAME = bot_info.username
     await bot_application.start()
 
     if WEBHOOK_URL:
@@ -3072,9 +2895,14 @@ async def run_web():
     await server.serve()
 
 async def main():
+    global telegram_api_http
     bot_task = asyncio.create_task(run_bot())
     web_task = asyncio.create_task(run_web())
-    await asyncio.gather(bot_task, web_task)
+    try:
+        await asyncio.gather(bot_task, web_task)
+    finally:
+        if telegram_api_http:
+            await telegram_api_http.aclose()
 
 if __name__ == "__main__":
     asyncio.run(main())
