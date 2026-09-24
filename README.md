@@ -176,6 +176,7 @@
 
 | Command | Description |
 |:---|:---|
+| `/manage` | Open the inline owner control panel (stats, market, tasks, broadcasts) |
 | `/addcharacter` | Add new character (interactive) |
 | `/remove <id>` | Remove from market |
 | `/listchar` | List all characters |
@@ -317,13 +318,37 @@ python main.py
 ```
 
 **Features:**
-- 🔍 Real-time search
-- 🏷️ Anime filter tabs
-- 📱 Mobile-responsive
-- ✨ Glassmorphism design
-- ⚡ Zero-refresh navigation
+- 🔍 Debounced search by character, anime, or card ID
+- 🏷️ Anime and rarity filters, sort by price/name/rarity
+- ♥ Saved favorites, grid/list views, and one-tap card-ID copying
+- 📱 Responsive character cards with safe image URL handling
+- ↗ Buy links deep-link into the bot with the selected card prefilled
+- ⚡ Zero-refresh browsing backed by the live PostgreSQL collection
 
 </div>
+
+---
+
+## ✨ Telegram Bot API research & free messaging features
+
+The UI and owner panel use standard Bot API features; they do not depend on a Telegram Premium subscription, custom emoji, or paid broadcasts. Rich Messages use the regular Bot API 10.1 `sendRichMessage` / `editMessageText` rich-message payloads, with ordinary text-message fallback for older API servers. Owner-panel navigation and broadcast progress edit the existing message instead of posting a new message for each view/update.
+
+| Bot API release | Relevant capability reviewed |
+|:---|:---|
+| 10.3 | Rich-message buttons, expandable quotations, document blocks, and newer ephemeral-message options |
+| 10.2 | Rich-message media and explicit block input; ephemeral group replies can be edited/deleted |
+| 10.1 | Rich Markdown/HTML, structured rich messages, and rich-message editing/drafts |
+| 10.0 | Guest queries, polls with media, and bot access settings |
+| 9.6 | Managed bots and expanded poll controls |
+| 9.5 | Message drafts available to all bots, date-time formatting, and member tags |
+| 9.4 | Private-chat topics and styled buttons; custom emoji specifically requires the bot owner to have Premium |
+| 9.3 | Private-chat topics and native streaming drafts |
+| 9.2 | Channel direct-message topics, suggested posts, and replies to checklist tasks |
+| 9.1 | Native checklist updates and checklist task editing for business bots |
+
+We intentionally avoid Premium-gated custom emoji and Star-paid broadcast acceleration. Native `sendMessageDraft` is available to all bots, but this collection bot has no generated/LLM response stream to display; menus instead use in-place rich-message edits, while long broadcasts show periodic progress in one edited status message.
+
+References: [Official Bot API changelog](https://core.telegram.org/bots/api-changelog), [Bot API reference](https://core.telegram.org/bots/api), [Bot features](https://core.telegram.org/bots/features#rich-messages).
 
 ---
 
